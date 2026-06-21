@@ -168,6 +168,7 @@ func withNetworkIfacesResources(vmi *v1.VirtualMachineInstance, domainSpec *api.
 	for i := 0; i < reservedSlots; i++ {
 		domainSpec.Devices.Controllers = append(domainSpec.Devices.Controllers, api.Controller{
 			Type:  "pci",
+			Index: fmt.Sprintf("%d", i+1),
 			Model: "pcie-root-port",
 		})
 	}
