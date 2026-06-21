@@ -2017,6 +2017,9 @@ func (l *LibvirtDomainManager) buildDevicesMetadata(vmi *v1.VirtualMachineInstan
 	devices := domainSpec.Devices
 	interfaces := devices.Interfaces
 	for _, nic := range interfaces {
+		if nic.Alias == nil {
+			continue
+		}
 		if data, exist := taggedInterfaces[nic.Alias.GetName()]; exist {
 			var mac string
 			if nic.MAC != nil {
