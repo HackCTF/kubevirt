@@ -196,6 +196,7 @@ func withNetworkIfacesResources(vmi *v1.VirtualMachineInstance, domainSpec *api.
 	// Only the devices are taken into account because some parameters are not assured to be returned when
 	// getting the domain spec (e.g. the `qemu:commandline` section).
 	domainSpecWithoutIfacePlaceholders.Devices.DeepCopyInto(&domainSpec.Devices)
+	domainSpec.UUID = domainSpecWithoutIfacePlaceholders.UUID
 
 	return f(vmi, domainSpec)
 }
