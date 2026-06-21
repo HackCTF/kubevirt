@@ -912,11 +912,17 @@ func NewUserDefinedAlias(aliasName string) *Alias {
 	return &Alias{name: aliasName, userDefined: true}
 }
 
-func (alias Alias) GetName() string {
+func (alias *Alias) GetName() string {
+	if alias == nil {
+		return ""
+	}
 	return alias.name
 }
 
-func (alias Alias) IsUserDefined() bool {
+func (alias *Alias) IsUserDefined() bool {
+	if alias == nil {
+		return false
+	}
 	return alias.userDefined
 }
 
