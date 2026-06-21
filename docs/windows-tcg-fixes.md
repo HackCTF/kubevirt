@@ -1,11 +1,11 @@
 # Windows 10 TCG Fixes for KubeVirt v1.3.1
 
-This document describes 3 fixes applied to KubeVirt v1.3.1 to enable Windows 10
+This document describes 5 fixes applied to KubeVirt v1.3.1 to enable Windows 10
 VirtualMachineInstances under TCG (software emulation, no KVM).
 
 **Branch:** [`hackctf/win10-tcg-fixes`](https://github.com/HackCTF/kubevirt/tree/hackctf/win10-tcg-fixes)
 **Based on:** `v1.3.1` tag
-**Status:** Verified on production cluster (Combate)
+**Status:** Verified on production cluster (Combate) — `virt-launcher:fixed-v5`
 
 ---
 
@@ -177,6 +177,62 @@ processes interfaces that have no `<alias>` — because the domain is in an
 intermediate state with incomplete interface definitions. This triggers
 Bug 1 (nil guard) and Bug 2 (pointer receiver) simultaneously.
 
+### Fix 4: Single-pass PCI topology (removes root cause entirely)
+
+**File:** `pkg/virt-launcher/virtwrap/nichotplug.go:163`
+
+Instead of the two-pass approach (placeholder interfaces → define →
+read-back → strip placeholders → re-define), the new code directly adds
+`pcie-root-port` controllers to the domain spec before the single
+`virDomainDefineXML` call.
+
+**Before:** ~65 lines with `appendPlaceholderInterfacesToTheDomain`,
+`newInterfacePlaceholder`, and the two-pass logic in `withNetworkIfacesResources`.
+
+**After:** ~15 lines:
+
+```go
+func withNetworkIfacesResources(vmi *v1.VirtualMachineInstance, domainSpec *api.DomainSpec, f func(v *v1.VirtualMachineInstance, s *api.DomainSpec) (cli.VirDomain, error)) (cli.VirDomain, error) {
+    if len(vmi.Spec.Domain.Devices.Interfaces) == 0 {
+        return f(vmi, domainSpec)
+    }
+    if val := vmi.Annotations[v1.PlacePCIDevicesOnRootComplex]; val == "true" {
+        return f(vmi, domainSpec)
+    }
+    reservedSlots := ReservedInterfaces - len(vmi.Spec.Domain.Devices.Interfaces)
+    for i := 0; i < reservedSlots; i++ {
+        domainSpec.Devices.Controllers = append(domainSpec.Devices.Controllers, api.Controller{
+            Type:  "pci",
+            Index: fmt.Sprintf("%d", i+1),
+            Model: "pcie-root-port",
+        })
+    }
+    return f(vmi, domainSpec)
+}
+```
+
+**Dependency removed:** Fix 3 (UUID preservation) is no longer needed —
+there is only one `virDomainDefineXML` call, so UUID is generated once
+and never mismatched.
+
+**Commit:** [`9000317`](https://github.com/HackCTF/kubevirt/commit/9000317)
+
+### Fix 4a: Controller index attribute
+
+**File:** `pkg/virt-launcher/virtwrap/nichotplug.go:172`
+
+The initial Fix 4 implementation omitted the `Index` attribute on PCI
+controllers. libvirt requires a unique integer index for each controller:
+
+```
+XML error: Invalid value for attribute 'index' in element 'controller':
+''. Expected integer value
+```
+
+**Fix:** Add `Index: fmt.Sprintf("%d", i+1)` to the controller struct.
+
+**Commit:** [`d304acc`](https://github.com/HackCTF/kubevirt/commit/d304acc)
+
 ## Fix Summary
 
 | Bug | File | Change | Lines | Severity |
@@ -184,12 +240,22 @@ Bug 1 (nil guard) and Bug 2 (pointer receiver) simultaneously.
 | 1 | `manager.go` | nil guard before `nic.Alias.GetName()` | +3 | P0 - crash |
 | 2 | `schema.go` | pointer receiver + nil check in `GetName()`/`IsUserDefined()` | +8/-2 | P0 - crash |
 | 3 | `nichotplug.go` | preserve UUID across double define | +1 | P0 - root cause |
+| 4 | `nichotplug.go` | single-pass PCI topology (remove two-pass) | +9/-65 | P1 - perf |
+| 4a | `nichotplug.go` | add controller Index attribute | +1 | P1 - libvirt compat |
 
-Total: **12 insertions, 2 deletions** across 3 files.
+Total: **22 insertions, 67 deletions** across 3 files.
 
 ## Build
 
 Prerequisites: Go 1.22+, `libvirt-dev`, Docker, access to a container registry.
+
+### Image tags
+
+| Tag | Fixes | Use |
+|-----|-------|-----|
+| `virt-launcher:fixed` | P0 (1+2+3) | Original fix |
+| `virt-launcher:fixed-v4` | P0 + Fix 4 (missing Index) | Broken, do not use |
+| `virt-launcher:fixed-v5` | P0 + Fix 4 + Fix 4a | **Current stable** |
 
 ```bash
 # Clone the fork
@@ -200,14 +266,13 @@ cd kubevirt
 CGO_ENABLED=1 go build -o virt-launcher ./cmd/virt-launcher/
 
 # Build Docker image (using official base for libvirt deps)
-# See Dockerfile.virt-launcher-fixed in patches/
-docker build -t registry.example.org/library/virt-launcher:fixed -f- . <<'DOCKERFILE'
+docker build -t registry.example.org/library/virt-launcher:fixed-v5 -f- . <<'DOCKERFILE'
 FROM quay.io/kubevirt/virt-launcher:v1.3.1
-COPY virt-launcher /usr/bin/virt-launcher
+COPY --chmod=755 virt-launcher /usr/bin/virt-launcher
 DOCKERFILE
 
 # Push to registry
-docker push registry.example.org/library/virt-launcher:fixed
+docker push registry.example.org/library/virt-launcher:fixed-v5
 ```
 
 ### Deploy
@@ -217,14 +282,24 @@ docker push registry.example.org/library/virt-launcher:fixed
 kubectl patch deploy -n kubevirt virt-controller --type merge -p '{
   "spec":{"template":{"spec":{"containers":[{
     "name":"virt-controller",
-    "args":["--launcher-image","registry.example.org/library/virt-launcher:fixed",
+    "args":["--launcher-image","registry.example.org/library/virt-launcher:fixed-v5",
              "--exporter-image","quay.io/kubevirt/virt-exportserver:v1.3.1",
              "--port","8443","-v","2"]
   }]}}}}
 }'
 
+# Wait for rollout
+kubectl rollout status deployment virt-controller -n kubevirt
+
 # Delete old virt-launcher pods to pick up new image
 kubectl delete pod -n win-lab -l kubevirt.io=virt-launcher
+```
+
+### Verify launcher image
+
+```bash
+kubectl get deploy -n kubevirt virt-controller -o jsonpath='{.spec.template.spec.containers[0].args}'
+# Expected: ["--launcher-image","registry.example.org/library/virt-launcher:fixed-v5",...]
 ```
 
 ## Verification
@@ -270,20 +345,65 @@ No `panic`, `SIGSEGV`, `nil pointer`, or `dirty virt-launcher shutdown`.
 /dev/kvm not present. Using software emulation.
 ```
 
+### Fix 4 verification: VMI creation latency
+
+With Fix 4, VMI creation is single-pass — only one `virDomainDefineXML` call.
+Observed transition times from the cluster:
+
+```
+win10-tcg-test-7:
+  Pending:    15:29:00
+  Scheduling: 15:29:00
+  Scheduled:  15:29:06
+  Running:    15:29:07  ← ~7s from Pending to Running
+```
+
+### Fix 4a verification: Controller XML
+
+Before fix:
+```xml
+<controller type="pci" index="" model="pcie-root-port"/>
+```
+
+After fix (libvirt-compliant):
+```xml
+<controller type="pci" index="1" model="pcie-root-port"/>
+<controller type="pci" index="2" model="pcie-root-port"/>
+<controller type="pci" index="3" model="pcie-root-port"/>
+```
+
+### QEMU command line (TCG + PCI topology)
+
+```
+-accel tcg
+-machine pc-q35-rhel9.4.0,...,acpi=off
+-device {"driver":"pcie-root-port","port":16,"chassis":1,"id":"pci.1","bus":"pcie.0"}
+-device {"driver":"pcie-root-port","port":17,"chassis":2,"id":"pci.2","bus":"pcie.0"}
+-device {"driver":"pcie-root-port","port":18,"chassis":3,"id":"pci.3","bus":"pcie.0"}
+...
+-m size=6291456k
+```
+
+### OOMKill threshold
+
+QEMU under TCG requires significant memory overhead beyond guest RAM:
+
+| VMI | Guest | Container limit | Result | Survival |
+|-----|-------|-----------------|--------|----------|
+| test-5 | 4Gi | 4.3Gi | OOMKilled | ~7min |
+| test-6 | 6Gi | 6.3Gi | OOMKilled | ~3.5min |
+| test-7 | 6Gi | 8.3Gi | **Stable** | **7.5min+** |
+
+**Rule:** For Windows 10 under TCG, set container memory limit to
+`guest_RAM + 2Gi` (approximately 30% overhead for QEMU + TCG).
+
 ## Remaining Issues
 
-1. **Cilium host-to-pod connectivity:** Only one node (`funny-einstein`) has
-   working host→pod traffic. Other nodes drop traffic due to
-   `kube-proxy-replacement: true` + `routing-mode: tunnel` interaction.
-   Pods with health probes (liveness/readiness) must run on that node.
+1. **TCG performance:** Software emulation is extremely slow for Windows
+   (~2-5% native). Enable KVM (nested virtualization) for production use.
+   The 5 fixes make VMI creation and runtime stable — performance is the
+   remaining limitation.
 
-2. **Stale CiliumNode podCIDRs:** Node CIDRs still from old
-   `10.0.0.0/8` range after pool migration to `10.200.0.0/16`. Requires
-   drain + re-allocation.
-
-3. **TCG performance:** Software emulation is extremely slow for Windows.
-   Enable KVM (nested virtualization) for production use.
-
-4. **Fix 4 (P1):** Single-pass PCI topology computation to eliminate the
-   two-pass domain define entirely, improving performance and removing
-   the root cause scenario entirely.
+2. **Node memory pressure:** 8Gi container limit for 6Gi guest RAM reduces
+   VMI density on small nodes. Use TCG only for testing; production should
+   use KVM.
