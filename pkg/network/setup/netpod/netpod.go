@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"time"
 
 	k8serrors "k8s.io/apimachinery/pkg/util/errors"
 
@@ -76,6 +77,11 @@ type NetPod struct {
 
 	cacheCreator cacheCreator
 	state        *State
+
+	// readinessTimeout is the max time to wait for secondary network
+	// interfaces to appear in the pod's netns before failing Setup().
+	// Defaults to 30s. Set via WithReadinessTimeout.
+	readinessTimeout time.Duration
 }
 
 type option func(*NetPod)
@@ -93,7 +99,8 @@ func NewNetPod(vmiNetworks []v1.Network, vmiIfaces []v1.Interface, vmiUID string
 		nmstateAdapter:    nmstate.New(),
 		masqueradeAdapter: masquerade.New(),
 
-		cacheCreator: cache.CacheCreator{},
+		cacheCreator:     cache.CacheCreator{},
+		readinessTimeout: 30 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(&n)
@@ -116,6 +123,14 @@ func WithMasqueradeAdapter(h masqueradeAdapter) option {
 func WithCacheCreator(c cacheCreator) option {
 	return func(n *NetPod) {
 		n.cacheCreator = c
+	}
+}
+
+// WithReadinessTimeout sets the max time to wait for secondary network
+// interfaces to appear in the pod's netns before failing Setup().
+func WithReadinessTimeout(d time.Duration) option {
+	return func(n *NetPod) {
+		n.readinessTimeout = d
 	}
 }
 
@@ -157,6 +172,21 @@ func (n NetPod) Setup() error {
 			return err
 		}
 		log.Log.Infof("Current pod network: %s", currentStatusBytes)
+
+		// Wait for any expected interfaces not yet visible in the pod's netns.
+		// This handles the race where Multus/CNI hasn't finished setting up
+		// secondary networks by the time virt-handler tries to configure the VMI.
+		// If the interfaces are already visible (currentStatus has them),
+		// waitForInterfaces returns immediately.
+		expected := n.expectedPodIfaces()
+		if len(expected) > 0 {
+			waiter := readinessWaiter{timeout: n.readinessTimeout}
+			if werr := waiter.waitForInterfacesViaNSExec(expected); werr != nil {
+				log.Log.Reason(werr).Error("interface readiness waiter failed; falling through to discover")
+				// Don't fail here — let discover() do its own check. The
+				// workqueue retry will catch persistent failures.
+			}
+		}
 
 		if derr := n.discover(currentStatus); derr != nil {
 			return derr
@@ -601,4 +631,19 @@ func (n NetPod) clearCache(nets []v1.Network) error {
 		return k8serrors.NewAggregate(unplugErrors)
 	}
 	return n.state.Delete(nets)
+}
+
+// expectedPodIfaces returns the set of pod interface names that this
+// NetPod expects to find in the pod's netns. These are derived from
+// vmiSpecNets — each network's Name becomes the pod interface name
+// (e.g., "net1", "net2") that Multus/CNI creates.
+func (n NetPod) expectedPodIfaces() map[string]bool {
+	expected := make(map[string]bool)
+	if len(n.vmiSpecNets) == 0 {
+		return expected
+	}
+	for _, net := range n.vmiSpecNets {
+		expected[net.Name] = true
+	}
+	return expected
 }

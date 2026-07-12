@@ -1,0 +1,46 @@
+FROM ubuntu:22.04
+
+ARG GO_VERSION=1.22.2
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV GOPATH=/go
+ENV GOBIN=/go/bin
+ENV PATH=/go/bin:/usr/local/go/bin:$PATH
+
+# Install build dependencies for kubevirt (cgo + libvirt + selinux + bash + git)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    gcc \
+    git \
+    libselinux1-dev \
+    libvirt-dev \
+    pkg-config \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Go
+RUN wget -q https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz -O /tmp/go.tar.gz \
+    && tar -C /usr/local -xzf /tmp/go.tar.gz \
+    && rm /tmp/go.tar.gz \
+    && /usr/local/go/bin/go version
+
+WORKDIR /src
+
+# Copy source code
+COPY . /src
+
+# Set up vendoring — kubevirt uses replace directives for staging modules
+ENV GOFLAGS=-mod=mod
+
+# Build virt-handler with cgo and selinux tag
+RUN go build -tags selinux -o /out/virt-handler ./cmd/virt-handler/
+
+# Build virt-launcher too (used as sidecar)
+RUN go build -tags selinux -o /out/virt-launcher ./cmd/virt-launcher/
+
+# Verify
+RUN ls -la /out/
+
+CMD ["/bin/bash"]

@@ -1,0 +1,13 @@
+FROM harbor.k8s.local/library/virt-handler:v1.3.1
+
+# Replace the existing virt-handler binary with our patched version that
+# contains the netlink-based readiness waiter for secondary network interfaces.
+# This fixes the race condition where virt-handler triggers setupNetwork()
+# before Multus has finished creating secondary networks (net1, net2, ...).
+COPY _out/virt-handler /usr/bin/virt-handler
+
+# Verify the new binary is in place and contains our fix
+RUN /usr/bin/virt-handler --version 2>&1 | head -3 || true
+
+# Default command matches the original image
+CMD ["virt-handler"]
