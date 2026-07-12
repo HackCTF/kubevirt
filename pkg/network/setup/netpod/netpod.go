@@ -92,15 +92,19 @@ func NewNetPod(vmiNetworks []v1.Network, vmiIfaces []v1.Interface, vmiUID string
 		vmiSpecNets:   vmiNetworks,
 		vmiUID:        vmiUID,
 		podPID:        podPID,
-		ownerID:       ownerID,
+		ownerID:        ownerID,
 		queuesCap:     queuesCapacity,
 		state:         state,
 
 		nmstateAdapter:    nmstate.New(),
 		masqueradeAdapter: masquerade.New(),
 
-		cacheCreator:     cache.CacheCreator{},
-		readinessTimeout: 30 * time.Second,
+		cacheCreator: cache.CacheCreator{},
+		// readinessTimeout defaults to 0 (waiter disabled). Production
+		// code should call WithReadinessTimeout to enable it. The waiter
+		// subscribes to netlink events and blocks Setup() until interfaces
+		// appear, which is undesirable in unit tests.
+		readinessTimeout: 0,
 	}
 	for _, opt := range opts {
 		opt(&n)
@@ -176,12 +180,14 @@ func (n NetPod) Setup() error {
 		// Wait for any expected interfaces not yet visible in the pod's netns.
 		// This handles the race where Multus/CNI hasn't finished setting up
 		// secondary networks by the time virt-handler tries to configure the VMI.
-		// If the interfaces are already visible (currentStatus has them),
-		// waitForInterfaces returns immediately.
+		// If all expected interfaces are already visible in currentStatus,
+		// we skip the wait entirely — this is the common happy path.
 		expected := n.expectedPodIfaces()
-		if len(expected) > 0 {
+		missing := missingFromStatus(expected, currentStatus)
+		if len(missing) > 0 {
+			log.Log.Infof("Waiting for pod interfaces not yet visible: %v", missing)
 			waiter := readinessWaiter{timeout: n.readinessTimeout}
-			if werr := waiter.waitForInterfacesViaNSExec(expected); werr != nil {
+			if werr := waiter.waitForInterfacesViaNSExec(missing); werr != nil {
 				log.Log.Reason(werr).Error("interface readiness waiter failed; falling through to discover")
 				// Don't fail here — let discover() do its own check. The
 				// workqueue retry will catch persistent failures.
@@ -634,16 +640,35 @@ func (n NetPod) clearCache(nets []v1.Network) error {
 }
 
 // expectedPodIfaces returns the set of pod interface names that this
-// NetPod expects to find in the pod's netns. These are derived from
-// vmiSpecNets — each network's Name becomes the pod interface name
-// (e.g., "net1", "net2") that Multus/CNI creates.
+// NetPod expects to find in the pod's netns. Uses the same naming
+// scheme as nmstate/multus: default network → "eth0", secondary
+// networks → "net1", "net2", ... (ordinal).
 func (n NetPod) expectedPodIfaces() map[string]bool {
 	expected := make(map[string]bool)
 	if len(n.vmiSpecNets) == 0 {
 		return expected
 	}
 	for _, net := range n.vmiSpecNets {
-		expected[net.Name] = true
+		if name := namescheme.OrdinalPodInterfaceName(net.Name, n.vmiSpecNets); name != "" {
+			expected[name] = true
+		}
 	}
 	return expected
+}
+
+// missingFromStatus returns the subset of expected interface names that
+// are not yet present in the given nmstate.Status. This is used to skip
+// the readiness wait entirely when all interfaces are already visible.
+func missingFromStatus(expected map[string]bool, status *nmstate.Status) map[string]bool {
+	missing := make(map[string]bool, len(expected))
+	for name := range expected {
+		missing[name] = true
+	}
+	if status == nil {
+		return missing
+	}
+	for _, iface := range status.Interfaces {
+		delete(missing, iface.Name)
+	}
+	return missing
 }

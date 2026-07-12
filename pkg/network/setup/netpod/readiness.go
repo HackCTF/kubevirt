@@ -63,8 +63,15 @@ type readinessWaiter struct {
 // waitForInterfacesViaNSExec opens a netlink subscription in the current
 // netns (caller is inside NSExec.Do) and waits for the expected interfaces
 // to appear. Returns nil on subscribe failure (graceful fallback).
+//
+// If w.timeout is 0, the waiter is disabled entirely (used for tests
+// and environments where the netlink subscription is not desired).
 func (w readinessWaiter) waitForInterfacesViaNSExec(expected map[string]bool) error {
 	if len(expected) == 0 {
+		return nil
+	}
+	if w.timeout <= 0 {
+		// Waiter explicitly disabled.
 		return nil
 	}
 
@@ -229,7 +236,9 @@ func parseLinkName(data []byte) string {
 	for len(attrs) >= unix.SizeofRtAttr {
 		// Manual alignment parse — avoid unsafe.Pointer use which may
 		// cause issues on some Go versions with strict alignment.
-		attrLen := int(uint16(attrs[4]) | uint16(attrs[5])<<8)
+		// struct rtattr { u16 rta_len; u16 rta_type; ... } — both u16 fields
+		// are little-endian (Linux netlink ABI).
+		attrLen := int(uint16(attrs[0]) | uint16(attrs[1])<<8)
 		attrType := int(uint16(attrs[2]) | uint16(attrs[3])<<8)
 
 		if attrLen < unix.SizeofRtAttr || attrLen > len(attrs) {

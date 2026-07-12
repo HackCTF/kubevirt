@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	"kubevirt.io/client-go/log"
 
@@ -112,6 +113,9 @@ func (c *NetConf) Setup(vmi *v1.VirtualMachineInstance, networks []v1.Network, l
 		state,
 		netpod.WithMasqueradeAdapter(newMasqueradeAdapter(vmi)),
 		netpod.WithCacheCreator(c.cacheCreator),
+		// Enable the readiness waiter so secondary network interfaces
+		// have time to appear before we try to configure the VMI network.
+		netpod.WithReadinessTimeout(30*time.Second),
 	)
 
 	if err := netpod.Setup(); err != nil {
