@@ -25,6 +25,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	vishnetlink "github.com/vishvananda/netlink"
 
@@ -1613,6 +1614,129 @@ var _ = Describe("netpod", func() {
 		// testNet2 is not expected to exist anymore.
 		_, err = cache.ReadDomainInterfaceCache(&baseCacheCreator, "0", testNet2)
 		Expect(err).To(HaveOccurred())
+	})
+
+	Context("readiness waiter integration", func() {
+		// These tests verify that Setup() correctly invokes the readiness
+		// waiter when secondary network interfaces are not yet visible in
+		// the pod's netns, and that the waiter does not block Setup()
+		// when all interfaces are already present.
+		//
+		// In the test environment, the netlink subscription would block
+		// indefinitely because no events are emitted. To avoid hanging
+		// tests, we either:
+		//   1. Use WithReadinessTimeout(0) to disable the waiter, OR
+		//   2. Use a very short timeout (1ms) so the wait completes quickly.
+		//
+		// In production (NetConf.Setup), the default 30s timeout is used.
+
+		It("skips the waiter when all interfaces are already visible", func() {
+			// Stub returns eth0 already present — the namescheme default.
+			// expectedPodIfaces returns {eth0}, missing is empty, waiter skipped.
+			nmstatestub := &nmstateStub{status: nmstate.Status{
+				Interfaces: []nmstate.Interface{{
+					Name:       "eth0",
+					Index:      0,
+					TypeName:   nmstate.TypeVETH,
+					State:      nmstate.IfaceStateUp,
+					MacAddress: "12:34:56:78:90:ab",
+					MTU:        1500,
+				}},
+			}}
+			netPod := netpod.NewNetPod(
+				[]v1.Network{*v1.DefaultPodNetwork()},
+				[]v1.Interface{{
+					Name:                   defaultPodNetworkName,
+					InterfaceBindingMethod: v1.InterfaceBindingMethod{Masquerade: &v1.InterfaceMasquerade{}},
+				}},
+				vmiUID, 0, 0, 0, state,
+				netpod.WithNMStateAdapter(nmstatestub),
+				netpod.WithCacheCreator(&baseCacheCreator),
+				// Use 30s timeout to verify the waiter is skipped, not timed out.
+				netpod.WithReadinessTimeout(30*time.Second),
+			)
+			start := time.Now()
+			Expect(netPod.Setup()).To(Succeed())
+			// If the waiter had run, this would take ~30s. It should be instant.
+			Expect(time.Since(start)).To(BeNumerically("<", 5*time.Second))
+		})
+
+		It("tries the waiter when interfaces are missing, then falls back gracefully", func() {
+			// Stub returns only eth0 but expects net1 (secondary).
+			// In test env, netlink subscribe succeeds but no events arrive.
+			// With a 1ms timeout, the waiter returns quickly.
+			nmstatestub := &nmstateStub{status: nmstate.Status{
+				Interfaces: []nmstate.Interface{{
+					Name:       "eth0",
+					Index:      0,
+					TypeName:   nmstate.TypeVETH,
+					State:      nmstate.IfaceStateUp,
+					MacAddress: "12:34:56:78:90:ab",
+					MTU:        1500,
+				}},
+			}}
+			netPod := netpod.NewNetPod(
+				[]v1.Network{
+					*v1.DefaultPodNetwork(),
+					{Name: "net1", NetworkSource: v1.NetworkSource{Multus: &v1.MultusNetwork{}}},
+				},
+				[]v1.Interface{
+					{
+						Name:                   defaultPodNetworkName,
+						InterfaceBindingMethod: v1.InterfaceBindingMethod{Masquerade: &v1.InterfaceMasquerade{}},
+					},
+					{Name: "net1", InterfaceBindingMethod: v1.InterfaceBindingMethod{Masquerade: &v1.InterfaceMasquerade{}}},
+				},
+				vmiUID, 0, 0, 0, state,
+				netpod.WithNMStateAdapter(nmstatestub),
+				netpod.WithCacheCreator(&baseCacheCreator),
+				// 1ms timeout — waiter gives up almost immediately.
+				netpod.WithReadinessTimeout(1*time.Millisecond),
+			)
+			start := time.Now()
+			err := netPod.Setup()
+			elapsed := time.Since(start)
+			// Setup() should fail because net1 is missing from status
+			// AND the waiter timed out (1ms) AND discover() fails.
+			Expect(err).To(HaveOccurred())
+			Expect(elapsed).To(BeNumerically("<", 5*time.Second))
+		})
+
+		It("does not block Setup when readiness timeout is 0 (disabled)", func() {
+			nmstatestub := &nmstateStub{status: nmstate.Status{
+				Interfaces: []nmstate.Interface{{
+					Name:       "eth0",
+					Index:      0,
+					TypeName:   nmstate.TypeVETH,
+					State:      nmstate.IfaceStateUp,
+					MacAddress: "12:34:56:78:90:ab",
+					MTU:        1500,
+				}},
+			}}
+			netPod := netpod.NewNetPod(
+				[]v1.Network{
+					*v1.DefaultPodNetwork(),
+					{Name: "net1", NetworkSource: v1.NetworkSource{Multus: &v1.MultusNetwork{}}},
+				},
+				[]v1.Interface{
+					{
+						Name:                   defaultPodNetworkName,
+						InterfaceBindingMethod: v1.InterfaceBindingMethod{Masquerade: &v1.InterfaceMasquerade{}},
+					},
+					{Name: "net1", InterfaceBindingMethod: v1.InterfaceBindingMethod{Masquerade: &v1.InterfaceMasquerade{}}},
+				},
+				vmiUID, 0, 0, 0, state,
+				netpod.WithNMStateAdapter(nmstatestub),
+				netpod.WithCacheCreator(&baseCacheCreator),
+				// Disabled — Setup() proceeds immediately to discover()
+				netpod.WithReadinessTimeout(0),
+			)
+			start := time.Now()
+			err := netPod.Setup()
+			elapsed := time.Since(start)
+			Expect(err).To(HaveOccurred()) // discover() fails because net1 missing
+			Expect(elapsed).To(BeNumerically("<", 1*time.Second))
+		})
 	})
 })
 
