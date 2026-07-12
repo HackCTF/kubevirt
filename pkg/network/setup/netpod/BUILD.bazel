@@ -6,6 +6,7 @@ go_library(
         "discover.go",
         "discoverbridge.go",
         "netpod.go",
+        "readiness.go",
         "state.go",
     ],
     importpath = "kubevirt.io/kubevirt/pkg/network/setup/netpod",
@@ -25,6 +26,7 @@ go_library(
         "//staging/src/kubevirt.io/api/core/v1:go_default_library",
         "//staging/src/kubevirt.io/client-go/log:go_default_library",
         "//vendor/github.com/vishvananda/netlink:go_default_library",
+        "//vendor/golang.org/x/sys/unix:go_default_library",
         "//vendor/k8s.io/apimachinery/pkg/util/errors:go_default_library",
         "//vendor/k8s.io/utils/net:go_default_library",
     ],
@@ -35,6 +37,7 @@ go_test(
     srcs = [
         "netpod_suite_test.go",
         "netpod_test.go",
+        "readiness_test.go",
         "state_test.go",
     ],
     deps = [
@@ -52,5 +55,6 @@ go_test(
         "//vendor/github.com/onsi/ginkgo/v2:go_default_library",
         "//vendor/github.com/onsi/gomega:go_default_library",
         "//vendor/github.com/vishvananda/netlink:go_default_library",
+        "//vendor/golang.org/x/sys/unix:go_default_library",
     ],
 )
