@@ -1,0 +1,10 @@
+FROM harbor.k8s.local/library/virt-launcher:v1.3.1
+
+# Replace virt-launcher binary with patched version containing
+# the netlink readiness watcher for secondary network interfaces.
+COPY _out/virt-launcher /usr/bin/virt-launcher
+
+# Verify
+RUN /usr/bin/virt-launcher --version 2>&1 | head -3 || true
+
+CMD ["virt-launcher"]
