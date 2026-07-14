@@ -41,6 +41,8 @@ import (
 
 type TermFileError struct{}
 type SocketFileError struct{}
+type DirectoryTimeoutError struct{}
+type SocketTimeoutError struct{}
 
 func (m *TermFileError) Error() string {
 	return "termFile got detected"
@@ -48,6 +50,14 @@ func (m *TermFileError) Error() string {
 
 func (m *SocketFileError) Error() string {
 	return "socketFile got removed"
+}
+
+func (m *DirectoryTimeoutError) Error() string {
+	return "directory timeout: expected directory is still not ready"
+}
+
+func (m *SocketTimeoutError) Error() string {
+	return "socket timeout: serial console socket not created"
 }
 
 type VirtTail struct {
@@ -128,7 +138,7 @@ func (v *VirtTail) watchFS() error {
 		}
 	}
 	if !found {
-		rerr := errors.New("expected directory is still not ready")
+		rerr := &DirectoryTimeoutError{}
 		log.Log.V(3).Infof("watchFS error: %v", rerr)
 		return rerr
 	}
@@ -151,7 +161,7 @@ func (v *VirtTail) watchFS() error {
 		case <-socketCheckCh:
 			if !socketExists {
 				if socketExists = v.checkFile(socketFile); !socketExists {
-					rerr := errors.New("socketFile is still not ready")
+					rerr := &SocketTimeoutError{}
 					log.Log.V(3).Infof("watchFS error: %v", rerr)
 					return rerr
 				}
@@ -221,7 +231,7 @@ func main() {
 
 	// wait for all errgroup goroutines
 	if err := g.Wait(); err != nil {
-		if !(errors.Is(err, context.Canceled) || errors.Is(err, &TermFileError{}) || errors.Is(err, &SocketFileError{})) {
+		if !(errors.Is(err, context.Canceled) || errors.Is(err, &TermFileError{}) || errors.Is(err, &SocketFileError{}) || errors.Is(err, &DirectoryTimeoutError{}) || errors.Is(err, &SocketTimeoutError{})) {
 			log.Log.V(3).Infof("received error: %v", err)
 			os.Exit(1)
 		}

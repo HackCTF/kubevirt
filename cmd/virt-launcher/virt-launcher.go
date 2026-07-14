@@ -376,11 +376,11 @@ func main() {
 	// Initialize local and shared directories
 	initializeDirs(*ephemeralDiskDir, *containerDiskDir, *hotplugDiskDir, *uid)
 
-	if !*runWithNonRoot {
-		err := virtlauncher.InitializeConsoleLogFile(filepath.Join("/var/run/kubevirt-private", *uid))
-		if err != nil {
-			panic(err)
-		}
+	// Always initialize the console log file (not just when runWithNonRoot=false).
+	// The guest-console-log sidecar needs this file to exist regardless of run mode.
+	err := virtlauncher.InitializeConsoleLogFile(filepath.Join("/var/run/kubevirt-private", *uid))
+	if err != nil {
+		panic(err)
 	}
 
 	if *simulateCrash {
@@ -389,7 +389,7 @@ func main() {
 
 	// Block until all requested hookSidecars are ready
 	hookManager := hooks.GetManager()
-	err := hookManager.Collect(*hookSidecars, *qemuTimeout)
+	err = hookManager.Collect(*hookSidecars, *qemuTimeout)
 	if err != nil {
 		panic(err)
 	}
