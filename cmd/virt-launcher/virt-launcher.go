@@ -20,8 +20,12 @@
 package main
 
 import (
+	"crypto/tls"
+	"encoding/json"
 	goflag "flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -395,16 +399,139 @@ func runPreStartHook(vmiUID string, domainSpec interface{}) error {
 	return fmt.Errorf("timeout waiting for interfaces %v", missing)
 }
 
-// discoverExpectedInterfaces reads expected interface names from env or annotations.
-// HackCTF: we set VIRT_LAUNCHER_SECONDARY_INTERFACES env var from the test runner
-// or rely on the VM spec. For now, scan /sys/class/net for non-eth0 interfaces
-// that don't exist yet (heuristic: if at least one net1/net2 is expected).
+// discoverExpectedInterfaces reads expected interface names from the pod's
+// k8s.v1.cni.cncf.io/networks annotation, or from env var. This ensures we
+// wait for the correct interface names (which may be hashed by OVN-K).
 func discoverExpectedInterfaces() []string {
 	if val := os.Getenv("VIRT_LAUNCHER_SECONDARY_INTERFACES"); val != "" {
 		return strings.Split(val, ",")
 	}
-	// Default: assume net1 is expected (the common case for L2 NAD benchmark)
+
+	// Try to read the pod's CNI networks annotation to discover actual interface names.
+	// The annotation format is:
+	// [{"name":"nad-name","namespace":"ns","interface":"eth1"}]
+	ns := os.Getenv("POD_NAMESPACE")
+	if ns == "" {
+		ns = "default"
+	}
+	podName := os.Getenv("POD_NAME")
+	if podName == "" {
+		return []string{"net1"}
+	}
+
+	ifaceNames := discoverInterfacesFromCNIAnnotation(ns, podName)
+	if len(ifaceNames) > 0 {
+		log.Log.Infof("prestart: discovered secondary interfaces from CNI annotation: %v", ifaceNames)
+		return ifaceNames
+	}
+
+	// Fallback: scan /sys/class/net for non-eth0 interfaces that appeared recently.
+	// This catches interfaces created by CNI plugins that don't set the annotation.
+	interfaces := scanRecentSecondaryInterfaces()
+	if len(interfaces) > 0 {
+		log.Log.Infof("prestart: discovered secondary interfaces from netns scan: %v", interfaces)
+		return interfaces
+	}
+
 	return []string{"net1"}
+}
+
+// discoverInterfacesFromCNIAnnotation reads the k8s.v1.cni.cncf.io/networks
+// annotation from the pod and returns the list of secondary interface names.
+func discoverInterfacesFromCNIAnnotation(ns, podName string) []string {
+	tokenFile := "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	caFile := "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+	// Try to read pod annotations from the API server
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	req, err := http.NewRequest("GET", "https://kubernetes.default.svc/api/v1/namespaces/"+ns+"/pods/"+podName, nil)
+	if err != nil {
+		return nil
+	}
+
+	token, err := os.ReadFile(tokenFile)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Authorization", "Bearer "+string(token))
+	req.Header.Set("Accept", "application/json")
+
+	// Skip TLS verification if CA cert is not available
+	transport := &http.Transport{}
+	if _, err := os.Stat(caFile); err == nil {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	} else {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+
+	var pod struct {
+		Metadata struct {
+			Annotations map[string]string `json:"annotations"`
+		} `json:"metadata"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&pod); err != nil {
+		return nil
+	}
+
+	cniAnnotation := pod.Metadata.Annotations["k8s.v1.cni.cncf.io/networks"]
+	if cniAnnotation == "" || cniAnnotation == "null" {
+		return nil
+	}
+
+	// Parse the JSON array of network selections
+	var networks []struct {
+		Name      string `json:"name"`
+		Namespace string `json:"namespace"`
+		Interface string `json:"interface"`
+	}
+	if err := json.Unmarshal([]byte(cniAnnotation), &networks); err != nil {
+		return nil
+	}
+
+	var ifaces []string
+	for _, net := range networks {
+		// Skip the default network (which is eth0)
+		if net.Interface != "" && net.Interface != "eth0" && net.Interface != "net0" {
+			ifaces = append(ifaces, net.Interface)
+		}
+	}
+	return ifaces
+}
+
+// scanRecentSecondaryInterfaces scans /sys/class/net for interfaces that look
+// like secondary network interfaces (pod<hash> or net<id> patterns, excluding eth0).
+func scanRecentSecondaryInterfaces() []string {
+	entries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		return nil
+	}
+
+	var ifaces []string
+	for _, e := range entries {
+		name := e.Name()
+		// Skip standard interfaces
+		if name == "lo" || name == "eth0" || name == "net0" {
+			continue
+		}
+		// Accept pod<hash> (OVN-K hashed) or net<id> (ordinal) patterns
+		if strings.HasPrefix(name, "pod") || strings.HasPrefix(name, "net") {
+			ifaces = append(ifaces, name)
+		}
+	}
+	return ifaces
 }
 
 // checkMissingInterfaces returns the names of expected interfaces that are not yet
