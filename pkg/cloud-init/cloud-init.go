@@ -38,6 +38,7 @@ import (
 	"kubevirt.io/client-go/precond"
 
 	diskutils "kubevirt.io/kubevirt/pkg/ephemeral-disk-utils"
+	"kubevirt.io/kubevirt/pkg/network/vmispec"
 	"kubevirt.io/kubevirt/pkg/util"
 	"kubevirt.io/kubevirt/pkg/util/net/dns"
 )
@@ -689,4 +690,113 @@ func GenerateLocalData(vmi *v1.VirtualMachineInstance, instanceType string, data
 
 	log.Log.V(2).Infof("generated nocloud iso file %s", iso)
 	return nil
+}
+
+type ovnNetworkData struct {
+	IPAddresses []string `json:"ip_addresses"`
+	MACAddress  string   `json:"mac_address"`
+	GatewayIPs  []string `json:"gateway_ips"`
+	IPAddress   string   `json:"ip_address"`
+	GatewayIP   string   `json:"gateway_ip"`
+	Role        string   `json:"role"`
+}
+
+type ovnPodNetworks map[string]ovnNetworkData
+
+func GenerateNetworkDataFromOVNAnnotation(vmi *v1.VirtualMachineInstance, ovnAnnotPath string) (string, error) {
+	secondaryNets := getSecondaryNetworks(vmi)
+	if len(secondaryNets) == 0 {
+		return "", nil
+	}
+
+	data, err := os.ReadFile(ovnAnnotPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to read OVN pod networks annotation: %v", err)
+	}
+
+	annot := string(data)
+	if annot == "" {
+		return "", nil
+	}
+
+	var ovnNets ovnPodNetworks
+	if err := json.Unmarshal([]byte(annot), &ovnNets); err != nil {
+		return "", fmt.Errorf("failed to parse OVN pod networks annotation: %v", err)
+	}
+
+	macToIface := make(map[string]string)
+	for _, iface := range vmi.Spec.Domain.Devices.Interfaces {
+		if iface.MacAddress != "" {
+			macToIface[iface.MacAddress] = iface.Name
+		}
+	}
+
+	netConfig := make(map[string]interface{})
+	netConfig["version"] = 2
+	ethernets := make(map[string]map[string]interface{})
+
+	ifaceIdx := 0
+	for _, net := range vmi.Spec.Networks {
+		if net.Pod == nil {
+			iface := vmispec.LookupInterfaceByName(vmi.Spec.Domain.Devices.Interfaces, net.Name)
+			if iface == nil {
+				ifaceIdx++
+				continue
+			}
+			mac := iface.MacAddress
+			ovnNet, ok := ovnNets[net.Name]
+			if !ok {
+				for key, val := range ovnNets {
+					if val.MACAddress == mac {
+						ovnNet = val
+						_ = key
+						ok = true
+						break
+					}
+				}
+			}
+			if ok && ovnNet.IPAddress != "" {
+				guestIfaceName := fmt.Sprintf("eth%d", ifaceIdx)
+				ifaceConfig := make(map[string]interface{})
+				ifaceConfig["addresses"] = []string{ovnNet.IPAddress}
+				if len(ovnNet.GatewayIPs) > 0 && ovnNet.Role != "primary" {
+					ifaceConfig["gateway4"] = ovnNet.GatewayIPs[0]
+				}
+				ethernets[guestIfaceName] = ifaceConfig
+			}
+		}
+		ifaceIdx++
+	}
+
+	if len(ethernets) == 0 {
+		return "", nil
+	}
+	netConfig["ethernets"] = ethernets
+
+	var buf strings.Builder
+	buf.WriteString("version: 2\n")
+	buf.WriteString("ethernets:\n")
+	for ifaceName, ifaceConfig := range ethernets {
+		buf.WriteString(fmt.Sprintf("  %s:\n", ifaceName))
+		if addrs, ok := ifaceConfig["addresses"].([]string); ok && len(addrs) > 0 {
+			buf.WriteString(fmt.Sprintf("    addresses:\n      - %s\n", addrs[0]))
+		}
+		if gw, ok := ifaceConfig["gateway4"].(string); ok && gw != "" {
+			buf.WriteString(fmt.Sprintf("    gateway4: %s\n", gw))
+		}
+	}
+	return buf.String(), nil
+}
+
+func getSecondaryNetworks(vmi *v1.VirtualMachineInstance) []v1.Network {
+	var secondary []v1.Network
+	for _, net := range vmi.Spec.Networks {
+		if net.Pod == nil {
+			secondary = append(secondary, net)
+		}
+	}
+	return secondary
 }

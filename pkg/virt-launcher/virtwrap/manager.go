@@ -77,6 +77,7 @@ import (
 	"kubevirt.io/kubevirt/pkg/hooks"
 	"kubevirt.io/kubevirt/pkg/ignition"
 	netsriov "kubevirt.io/kubevirt/pkg/network/deviceinfo"
+	"kubevirt.io/kubevirt/pkg/network/downwardapi"
 	netsetup "kubevirt.io/kubevirt/pkg/network/setup"
 	netvmispec "kubevirt.io/kubevirt/pkg/network/vmispec"
 	storagetypes "kubevirt.io/kubevirt/pkg/storage/types"
@@ -752,6 +753,16 @@ func (l *LibvirtDomainManager) preStartHook(vmi *v1.VirtualMachineInstance, doma
 		// detection of the disk driver cache mode
 		if err := cloudinit.PrepareLocalPath(vmi.Name, vmi.Namespace); err != nil {
 			return domain, fmt.Errorf("PrepareLocalPath failed: %v", err)
+		}
+		if cloudInitData.NetworkData == "" {
+			ovnAnnotPath := fmt.Sprintf("%s/%s", downwardapi.MountPath, downwardapi.OVNPodNetworksVolumePath)
+			generatedNetData, err := cloudinit.GenerateNetworkDataFromOVNAnnotation(vmi, ovnAnnotPath)
+			if err != nil {
+				logger.Warningf("Failed to generate network data from OVN annotation: %v", err)
+			} else if generatedNetData != "" {
+				logger.Infof("Auto-generated cloud-init network data for secondary interfaces")
+				cloudInitData.NetworkData = generatedNetData
+			}
 		}
 		// store the generated cloud init metadata.
 		// cloud init ISO will be generated after the domain definition

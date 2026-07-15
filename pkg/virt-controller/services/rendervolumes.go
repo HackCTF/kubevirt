@@ -120,6 +120,17 @@ func downwardAPIDirVolume(name, path, fieldPath string) k8sv1.Volume {
 	}
 }
 
+func downwardAPIDirVolumeWithItems(name string, items []k8sv1.DownwardAPIVolumeFile) k8sv1.Volume {
+	return k8sv1.Volume{
+		Name: name,
+		VolumeSource: k8sv1.VolumeSource{
+			DownwardAPI: &k8sv1.DownwardAPIVolumeSource{
+				Items: items,
+			},
+		},
+	}
+}
+
 func withVMIVolumes(pvcStore cache.Store, vmiSpecVolumes []v1.Volume, vmiVolumeStatus []v1.VolumeStatus) VolumeRendererOption {
 	return func(renderer *VolumeRenderer) error {
 		hotplugVolumesByName := hotplugVolumes(vmiVolumeStatus, vmiSpecVolumes)
@@ -499,6 +510,21 @@ func withNetworkDeviceInfoMapAnnotation() VolumeRendererOption {
 			downwardAPIDirVolume(
 				downwardapi.NetworkInfoVolumeName, downwardapi.NetworkInfoVolumePath, fmt.Sprintf("metadata.annotations['%s']", downwardapi.NetworkInfoAnnot)),
 		)
+		return nil
+	}
+}
+
+func withPodNetworkAnnotations() VolumeRendererOption {
+	return func(renderer *VolumeRenderer) error {
+		items := []k8sv1.DownwardAPIVolumeFile{
+			{
+				Path: downwardapi.OVNPodNetworksVolumePath,
+				FieldRef: &k8sv1.ObjectFieldSelector{
+					FieldPath: fmt.Sprintf("metadata.annotations['%s']", downwardapi.OVNPodNetworksAnnot),
+				},
+			},
+		}
+		renderer.podVolumes = append(renderer.podVolumes, downwardAPIDirVolumeWithItems(downwardapi.OVNPodNetworksVolumeName, items))
 		return nil
 	}
 }

@@ -24,7 +24,6 @@ import (
 	"encoding/json"
 	goflag "flag"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/signal"

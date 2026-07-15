@@ -37,10 +37,6 @@ func GeneratePodAnnotations(networks []virtv1.Network, interfaces []virtv1.Inter
 		log.Log.Warningf("failed to create network device-info-map: %v", err)
 	}
 
-	if len(networkDeviceInfoMap) == 0 {
-		return nil
-	}
-
 	networkDeviceInfoAnnotation := downwardapi.CreateNetworkInfoAnnotationValue(networkDeviceInfoMap)
 	return map[string]string{downwardapi.NetworkInfoAnnot: networkDeviceInfoAnnotation}
 }

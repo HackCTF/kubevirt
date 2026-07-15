@@ -1,18 +1,9 @@
-FROM harbor.k8s.local/library/virt-launcher:fix-guest-console-log-v2
+FROM harbor.k8s.local/library/virt-launcher:fix-tcg-multus-v1
 
-# Replace virt-launcher binary with version that includes the pre-start hook
-# to wait for secondary network interfaces before QEMU starts (HackCTF fix
-# for TCG + multus secondary NAD race condition).
+# Replace virt-launcher binary with version that includes:
+# 1. Pre-start hook to wait for secondary network interfaces (fix-tcg-multus-v1)
+# 2. Auto-generate cloud-init network config for secondary interfaces (NEW in v2)
 COPY _out/virt-launcher /usr/bin/virt-launcher
-
-# Replace virt-tail binary with version that has:
-# 1. Configurable socket timeout via VIRT_TAIL_SOCKET_TIMEOUT env var (default 120s)
-# 2. LogFileNotReadyError as non-fatal (allow container to survive missing log)
-COPY _out/virt-tail /usr/bin/virt-tail
-
-# Verify binaries
-RUN /usr/bin/virt-launcher --help 2>&1 | head -3 || true
-RUN /usr/bin/virt-tail --help 2>&1 | head -3 || /usr/bin/virt-tail --logfile=/tmp/test 2>&1 | head -3 || true
 
 # Default command matches the original image
 CMD ["virt-launcher"]
