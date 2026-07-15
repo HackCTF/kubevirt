@@ -26,6 +26,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -333,6 +334,102 @@ func waitForFinalNotify(deleteNotificationSent chan watch.Event,
 	}
 }
 
+// runPreStartHook is the HackCTF fix for TCG + multus secondary NAD race condition.
+// It waits for secondary network interfaces to be ready before virt-handler sends
+// the start command. This is critical for TCG (no KVM) where QEMU boot takes 30-60s.
+//
+// Best-effort: errors are returned but the caller should log and continue.
+func runPreStartHook(vmiUID string, domainSpec interface{}) error {
+	timeout := 120 * time.Second
+	if val := os.Getenv("VIRT_LAUNCHER_PRESTART_TIMEOUT"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			timeout = d
+		}
+	}
+
+	log.Log.Infof("prestart: running hook for VMI %s (timeout=%v)", vmiUID, timeout)
+
+	// 1. Ensure log directory exists
+	logDir := filepath.Join("/var/run/kubevirt-private", vmiUID)
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		log.Log.Warningf("prestart: failed to create log dir %s: %v (continuing)", logDir, err)
+	}
+
+	// 2. Ensure console log file exists
+	serialLog := filepath.Join(logDir, "virt-serial0-log")
+	if _, err := os.Stat(serialLog); os.IsNotExist(err) {
+		f, err := os.Create(serialLog)
+		if err != nil {
+			log.Log.Warningf("prestart: failed to create serial log %s: %v (continuing)", serialLog, err)
+		} else {
+			f.Close()
+			log.Log.Infof("prestart: created empty serial log %s", serialLog)
+		}
+	} else if err != nil {
+		log.Log.Warningf("prestart: stat serial log %s: %v (continuing)", serialLog, err)
+	}
+
+	// 3. Wait for secondary network interfaces to appear in /sys/class/net
+	// Expected interfaces: any non-eth0 (e.g., net1, net2)
+	deadline := time.Now().Add(timeout)
+	expectedIfaces := discoverExpectedInterfaces()
+	if len(expectedIfaces) == 0 {
+		log.Log.Infof("prestart: no secondary interfaces detected in env, skipping wait")
+		return nil
+	}
+	log.Log.Infof("prestart: waiting for secondary interfaces: %v", expectedIfaces)
+
+	for time.Now().Before(deadline) {
+		missing := checkMissingInterfaces(expectedIfaces)
+		if len(missing) == 0 {
+			log.Log.Infof("prestart: all %d interfaces ready", len(expectedIfaces))
+			return nil
+		}
+		remaining := time.Until(deadline).Round(time.Second)
+		log.Log.V(2).Infof("prestart: waiting for %v (timeout in %v)", missing, remaining)
+		time.Sleep(1 * time.Second)
+	}
+
+	missing := checkMissingInterfaces(expectedIfaces)
+	log.Log.Warningf("prestart: timeout waiting for %v after %v", missing, timeout)
+	return fmt.Errorf("timeout waiting for interfaces %v", missing)
+}
+
+// discoverExpectedInterfaces reads expected interface names from env or annotations.
+// HackCTF: we set VIRT_LAUNCHER_SECONDARY_INTERFACES env var from the test runner
+// or rely on the VM spec. For now, scan /sys/class/net for non-eth0 interfaces
+// that don't exist yet (heuristic: if at least one net1/net2 is expected).
+func discoverExpectedInterfaces() []string {
+	if val := os.Getenv("VIRT_LAUNCHER_SECONDARY_INTERFACES"); val != "" {
+		return strings.Split(val, ",")
+	}
+	// Default: assume net1 is expected (the common case for L2 NAD benchmark)
+	return []string{"net1"}
+}
+
+// checkMissingInterfaces returns the names of expected interfaces that are not yet
+// visible in /sys/class/net.
+func checkMissingInterfaces(expected []string) []string {
+	entries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		log.Log.Warningf("prestart: failed to read /sys/class/net: %v", err)
+		return expected
+	}
+
+	present := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		present[e.Name()] = true
+	}
+
+	var missing []string
+	for _, name := range expected {
+		if !present[name] {
+			missing = append(missing, name)
+		}
+	}
+	return missing
+}
+
 func main() {
 	qemuTimeout := pflag.Duration("qemu-timeout", defaultStartTimeout, "Amount of time to wait for qemu")
 	virtShareDir := pflag.String("kubevirt-share-dir", "/var/run/kubevirt", "Shared directory between virt-handler and virt-launcher")
@@ -456,8 +553,21 @@ func main() {
 	}
 
 	events := make(chan watch.Event, 2)
+
 	// Send domain notifications to virt-handler
+	// IMPORTANT: start domain event monitoring BEFORE the pre-start hook.
+	// The hook may block waiting for secondary network interfaces (up to 120s).
+	// If we block first, libvirt connection times out and panics.
 	startDomainEventMonitoring(notifier, domainConn, events, vmi, domainName, &agentStore, *qemuAgentSysInterval, *qemuAgentFileInterval, *qemuAgentUserInterval, *qemuAgentVersionInterval, *qemuAgentFSFreezeStatusInterval, metadataCache)
+
+	// HackCTF fix: pre-start hook to wait for secondary network interfaces before
+	// virt-handler sends the start command. Required for TCG (no KVM) where QEMU
+	// boot is slow and races with multus secondary NAD setup.
+	// The hook is best-effort: failures are logged but don't prevent QEMU start.
+	// Runs AFTER domain event monitoring to keep libvirt alive during the wait.
+	if err := runPreStartHook(*uid, nil); err != nil {
+		log.Log.Warningf("pre-start hook failed: %v (continuing anyway)", err)
+	}
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt,

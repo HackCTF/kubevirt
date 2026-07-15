@@ -43,6 +43,7 @@ type TermFileError struct{}
 type SocketFileError struct{}
 type DirectoryTimeoutError struct{}
 type SocketTimeoutError struct{}
+type LogFileNotReadyError struct{}
 
 func (m *TermFileError) Error() string {
 	return "termFile got detected"
@@ -60,6 +61,10 @@ func (m *SocketTimeoutError) Error() string {
 	return "socket timeout: serial console socket not created"
 }
 
+func (m *LogFileNotReadyError) Error() string {
+	return "logfile not ready: serial console log not created by QEMU"
+}
+
 type VirtTail struct {
 	ctx     context.Context
 	logFile string
@@ -69,6 +74,22 @@ type VirtTail struct {
 func (v *VirtTail) checkFile(socketFile string) bool {
 	_, err := os.Stat(socketFile)
 	return !os.IsNotExist(err)
+}
+
+// getSocketTimeout returns the timeout for waiting for the serial console socket.
+// Default is 120s (increased from 20s to support TCG + multus secondary NAD scenarios
+// where QEMU boot can take 30-60s and NAD setup adds additional time).
+// Configurable via VIRT_TAIL_SOCKET_TIMEOUT env var (duration string, e.g., "120s").
+func getSocketTimeout() time.Duration {
+	defaultTimeout := 120 * time.Second
+	if val := os.Getenv("VIRT_TAIL_SOCKET_TIMEOUT"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			log.Log.V(2).Infof("virt-tail: using custom socket timeout %v", d)
+			return d
+		}
+		log.Log.Warningf("virt-tail: invalid VIRT_TAIL_SOCKET_TIMEOUT %q, using default %v", val, defaultTimeout)
+	}
+	return defaultTimeout
 }
 
 func (v *VirtTail) tailLogs() error {
@@ -143,8 +164,8 @@ func (v *VirtTail) watchFS() error {
 		return rerr
 	}
 
-	// initial timeout for serial console socket creation
-	const initialSocketTimeout = time.Second * 20
+	// initial timeout for serial console socket creation (configurable, default 120s for TCG)
+	initialSocketTimeout := getSocketTimeout()
 	socketCheckCh := make(chan int)
 	time.AfterFunc(initialSocketTimeout, func() {
 		socketCheckCh <- 1
@@ -231,7 +252,12 @@ func main() {
 
 	// wait for all errgroup goroutines
 	if err := g.Wait(); err != nil {
-		if !(errors.Is(err, context.Canceled) || errors.Is(err, &TermFileError{}) || errors.Is(err, &SocketFileError{}) || errors.Is(err, &DirectoryTimeoutError{}) || errors.Is(err, &SocketTimeoutError{})) {
+		if !(errors.Is(err, context.Canceled) ||
+			errors.Is(err, &TermFileError{}) ||
+			errors.Is(err, &SocketFileError{}) ||
+			errors.Is(err, &DirectoryTimeoutError{}) ||
+			errors.Is(err, &SocketTimeoutError{}) ||
+			errors.Is(err, &LogFileNotReadyError{})) {
 			log.Log.V(3).Infof("received error: %v", err)
 			os.Exit(1)
 		}
