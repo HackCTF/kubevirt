@@ -649,7 +649,7 @@ func (n NetPod) expectedPodIfaces() map[string]bool {
 		return expected
 	}
 	for _, net := range n.vmiSpecNets {
-		if name := namescheme.OrdinalPodInterfaceName(net.Name, n.vmiSpecNets); name != "" {
+		if name := namescheme.HashedPodInterfaceName(net); name != "" {
 			expected[name] = true
 		}
 	}
